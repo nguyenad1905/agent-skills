@@ -21,7 +21,7 @@ Core doctrine: read [references/doctrine.md](references/doctrine.md) if any rule
 
 - Vercel CLI v53+ with `vercel metrics`, `vercel usage`, `vercel contract`, and `vercel api`.
 - Authenticated CLI session: `vercel login`.
-- Linked app directory: `vercel link`. `VERCEL_PROJECT_ID` can help resolve project config, but `vercel metrics` still requires directory linkage.
+- Linked Vercel directory: `vercel link` for a single project, or the repo root created by `vercel link --repo` for multi-project repositories. `VERCEL_PROJECT_ID` can select a project only when it matches the linked cwd; `vercel metrics` still requires directory linkage. Multi-project links require an explicit matching project ID.
 - Node.js 20+.
 - Observability Plus for route-level metric-backed recommendations.
 
@@ -60,13 +60,21 @@ RUN_DIR="$(mktemp -d -t vercel-optimize-XXXXXX)"
 
 ## Pipeline
 
-### 1. Collect, scan, and merge signals
+### 1. Collect Vercel signals and stop on blockers
 
-Run from the linked app directory or pass `--cwd` where a script supports it. Keep stdout JSON separate from stderr logs. Do not combine streams.
+Run from the linked Vercel directory or pass `--cwd` where a script supports it. For `vercel link --repo`, use the repo root and pass the exact project ID. Keep stdout JSON separate from stderr logs. Do not combine streams.
 
 ```bash
 node scripts/collect-signals.mjs [projectId] > "$RUN_DIR/vercel-signals.json" 2> "$RUN_DIR/collect.stderr"
 node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$RUN_DIR/vercel-signals.json"
+jq '{scopeBlocker, scopeBlockerDetail, scopeChoices, frameworkSupportBlocker, observabilityPlus, observabilityPlusUsable, observabilityPlusBlocker, observabilityPlusBlockerDetail}' "$RUN_DIR/vercel-signals.json"
+```
+
+If any blocker field is non-null, follow Step 1.1 before scanning source. Do not run `scan-codebase.mjs`, `merge-signals.mjs`, gating, or scanner-only mode from an unresolved project/team or metrics-access state.
+
+If collection is clear, scan and merge:
+
+```bash
 
 node scripts/scan-codebase.mjs <repo-root> > "$RUN_DIR/codebase.json"
 node scripts/merge-signals.mjs "$RUN_DIR/vercel-signals.json" "$RUN_DIR/codebase.json" --out "$RUN_DIR/signals.json"
@@ -76,18 +84,21 @@ Collection details, schemas, metric IDs, and degradation behavior live in [refer
 
 ### 1.1 Stop on blockers
 
-Check blockers before gating:
+Check blockers before scanning when using `vercel-signals.json`, and again before gating when using merged `signals.json`:
 
 ```bash
-jq '{frameworkSupportBlocker, observabilityPlus, observabilityPlusUsable, observabilityPlusBlocker, observabilityPlusBlockerDetail}' "$RUN_DIR/signals.json"
+jq '{scopeBlocker, scopeBlockerDetail, scopeChoices, frameworkSupportBlocker, observabilityPlus, observabilityPlusUsable, observabilityPlusBlocker, observabilityPlusBlockerDetail}' "$RUN_DIR/signals.json"
 ```
 
 Required actions:
 
+- `scopeBlocker !== null`: stop before scanning or gating. Ask the user to confirm the exact Vercel team and project. If `scopeChoices` is non-empty, show the choices; otherwise ask them to run `vercel link --yes --project <project-name-or-id> --cwd <app-dir>` and include `--team <team-id-or-slug>` when known. Do not run a scanner-only audit from an unresolved scope.
 - `frameworkSupportBlocker === "unsupported_framework"`: use the unsupported-framework prompt above.
 - `observabilityPlusBlocker === null`: continue.
 - `no_traffic`: tell the user route metrics are sparse; continue only if they accept limited output.
-- `payment_required` or `no_oplus_probe`: render [references/observability-plus.md](references/observability-plus.md) verbatim and ask.
+- `oplus_not_enabled`: render [references/observability-plus.md](references/observability-plus.md) verbatim and ask.
+- `payment_required`: tell the user route-level metrics were recognized but unusable; check subscription, quota, or access, or continue with a limited audit.
+- `oplus_probe_failed`: tell the user the probe was inconclusive, show `observabilityPlusBlockerDetail`, and ask them to verify the linked project/team or provide `$RUN_DIR/collect.stderr`. Do not say Observability Plus is disabled.
 - `project_disabled`: tell the user to enable Observability Plus for the project or accept a limited audit.
 - `daily_quota_exceeded`: stop and tell the user the Observability query quota is exhausted; retry after the next UTC midnight reset, or ask whether to continue with a limited code-only audit.
 - `not_linked`: link the app directory, then rerun Step 1. If app path and project are known:
@@ -295,11 +306,15 @@ Use these messages without adding sales copy or process detail.
 
 **Route-level metrics unavailable:**
 
-> Use the verbatim choice template in [references/observability-plus.md](references/observability-plus.md). Do not silently fall back to code-only mode; present the two-path choice: enable Observability Plus and rerun the metric-backed audit, or accept a limited code-only run.
+> Use the blocker-specific copy in [references/observability-plus.md](references/observability-plus.md). Do not silently fall back to code-only mode. If the blocker is inconclusive, say the probe failed and ask for project/team/link verification; only tell the user to enable Observability Plus when the metrics API explicitly reported that it is not enabled.
 
 **Project is not linked:**
 
 > This worktree is not linked to a Vercel project. Run `vercel link --yes --project <project-name-or-id> --cwd <app-dir>` and rerun the audit. If the team is known, add `--team <team-id-or-slug>`.
+
+**Project/team scope is ambiguous:**
+
+> I found more than one linked Vercel project for this directory. Which team and project should I audit? I need the exact project and team before collecting metrics so I do not mix data from another scope.
 
 **Most route-to-file mappings failed:**
 

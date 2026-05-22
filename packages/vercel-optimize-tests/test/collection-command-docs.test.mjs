@@ -19,6 +19,9 @@ test('collection docs keep JSON stdout separate from status logs', async () => {
   }
 
   assert.match(skill, /JSON\.parse\(require\("fs"\)\.readFileSync\(process\.argv\[1\], "utf8"\)\)/);
+  assert.match(skill, /jq '\{scopeBlocker, scopeBlockerDetail, scopeChoices/);
+  assert.match(skill, /before scanning source/);
+  assert.match(skill, /Do not run `scan-codebase\.mjs`, `merge-signals\.mjs`, gating, or scanner-only mode from an unresolved project\/team/);
   assert.match(skill, /Do not combine streams/);
 });
 

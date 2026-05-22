@@ -1,6 +1,6 @@
 # Observability Plus Stop-And-Ask
 
-Use this file only when `signals.observabilityPlusBlocker` is set. Do not silently continue into scanner-only mode unless the user chooses that path.
+Use this file only when `signals.observabilityPlusBlocker` is set. Do not silently continue into scanner-only mode unless the user chooses that path. Do not claim Observability Plus is disabled unless the blocker is `oplus_not_enabled` or the raw detail explicitly says the subscription is not enabled.
 
 ## Why This Check Exists
 
@@ -33,7 +33,7 @@ This audit needs route-level metrics to rank fixes by observed latency, cache hi
 Docs: https://vercel.com/docs/observability/observability-plus
 
 Choose one:
-1. Enable Observability Plus, then re-run the metric-backed audit.
+1. Fix per-route metrics access, then re-run the metric-backed audit.
 2. Continue in scanner-only mode for a limited audit.
 ```
 
@@ -41,11 +41,11 @@ If the host supports a structured question tool, use this exact customer-facing 
 
 ```json
 {
-  "question": "Enable Observability Plus and re-run, or continue with a limited scanner-only audit?",
-  "header": "Observability Plus",
+  "question": "Fix per-route metrics access and re-run, or continue with a limited scanner-only audit?",
+  "header": "Metrics access",
   "options": [
     {
-      "label": "Enable and re-run",
+      "label": "Fix and re-run",
       "description": "Use route-level metrics to rank the routes that matter most for cost and performance."
     },
     {
@@ -56,14 +56,14 @@ If the host supports a structured question tool, use this exact customer-facing 
 }
 ```
 
-Use the full product name in this question. Do not abbreviate product names or metrics in customer-facing blocker copy.
+Use the full product name when naming Observability Plus. Do not abbreviate product names or metrics in customer-facing blocker copy.
 
 ## After The User Chooses
 
-If the user chooses **Enable and re-run**, stop after this short response:
+If the user chooses **Fix and re-run**, stop after this short response:
 
 ```md
-Enable Observability Plus from the Vercel dashboard's Observability tab, then tell me to rerun. I'll restart the metric-backed audit once route-level metrics are available.
+Fix per-route metrics access, then tell me to rerun. I'll restart the metric-backed audit once route-level metrics are available.
 ```
 
 Do not include raw team IDs, org IDs, project IDs, pricing language, dashboard screenshots, or extra persuasion. The docs link in the blocker message already covers availability and billing details.
@@ -74,8 +74,10 @@ If the user chooses **Run scanner-only**, continue with the scanner-only steps b
 
 | Blocker | Detail |
 |---|---|
+| `oplus_not_enabled` | `Detected: Vercel reported that Observability Plus is not enabled for the current team/project scope.` |
+| `oplus_probe_failed` | `Detected: I could not confirm route-level metric access from the current CLI and project context.` |
 | `payment_required` | `Detected: route-level metrics were recognized for this team, but these metric queries are not usable.` |
-| `no_oplus_probe` | `Detected: this team does not expose the route-level metrics this audit needs.` |
+| `no_oplus_probe` | Legacy blocker from older skill versions. Treat as inconclusive unless the raw detail explicitly says Observability Plus is not enabled. Use `Detected: route-level metrics are unavailable from the current CLI and project context.` |
 | `not_linked` | `Detected: this app directory is not linked to a Vercel project.` |
 | `forbidden` | `Detected: the Vercel CLI is authenticated to a team that cannot read this project.` |
 | `project_not_found` | `Detected: the project ID is not visible to the authenticated team.` |
@@ -93,6 +95,8 @@ Add `--team <team-id-or-slug>` when the team is known. If the user supplied both
 For `forbidden` and `project_not_found`, ask the user to run `vercel switch <team>` or verify the project ID before presenting the Observability Plus choice.
 
 For `project_disabled`, do not present it as a team subscription problem. Ask the user to enable Observability Plus for this project, then re-run.
+
+For `oplus_probe_failed` and legacy `no_oplus_probe`, do not present the blocker as a subscription problem. Say the probe was inconclusive, show `signals.observabilityPlusBlockerDetail`, and ask the user to verify the linked project/team context or share `$RUN_DIR/collect.stderr`.
 
 For `no_traffic`, do not use this template. Tell the user the project has no meaningful traffic in the 14-day window, then ask whether to run scanner-only mode now or come back after traffic accumulates.
 

@@ -12,7 +12,7 @@ The skill never reads a source file without an observability signal pointing at 
 
 When `plan === 'enterprise'`, the gate run must surface these four checks before code-level recommendations. Field engineers confirm these are the highest-leverage account-level levers across every renewal audit:
 
-1. **Observability Plus enabled?** From `signals.observabilityPlus`. If false, the whole audit degrades; surface as a top-of-report item.
+1. **Project/team scope and per-route metrics usable?** From `signals.scopeBlocker`, `signals.observabilityPlusUsable`, and `signals.observabilityPlusBlocker`. If scope is unresolved, stop and ask for the exact team/project. If metrics are unusable, the whole audit degrades; surface the blocker as a top-of-report item without guessing the subscription state.
 2. **Reverse proxy in front?** Heuristic from response headers / CNAME chain (when collected). A non-Vercel CDN over Vercel ISR is usually a "dumb pipe" — wasted spend.
 3. **WAF rules enabled?** From `signals.project.security`. BotID + managed rules absent on a project with bot evidence is the most common cost spike.
 4. **ISR read:write ratio.** From `metrics.isrReadsByRoute` + `metrics.isrWritesByRoute`. Include CDN-tier reads (see [data-collection.md](data-collection.md)) before flagging "writes > reads."

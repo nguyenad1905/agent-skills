@@ -41,13 +41,17 @@ export async function checkAuth() {
 }
 
 // Supports newer `.vercel/repo.json` (multi-project) + legacy `.vercel/project.json` (single-project).
-export async function readProjectJson(cwd = process.cwd()) {
+export async function readLinkedProjects(cwd = process.cwd()) {
   try {
     const raw = await readFile(join(cwd, '.vercel', 'repo.json'), 'utf-8');
     const parsed = JSON.parse(raw);
-    const first = parsed?.projects?.[0];
-    if (first?.id) {
-      return { projectId: first.id, orgId: first.orgId ?? null, source: 'repo.json' };
+    const defaults = {
+      orgId: parsed?.orgId ?? parsed?.teamId ?? parsed?.accountId ?? null,
+      orgSlug: parsed?.orgSlug ?? parsed?.teamSlug ?? null,
+    };
+    const projects = normalizeRepoProjects(parsed?.projects, defaults);
+    if (projects.length > 0) {
+      return { source: 'repo.json', projects };
     }
   } catch { /* fall through */ }
 
@@ -55,31 +59,191 @@ export async function readProjectJson(cwd = process.cwd()) {
   try {
     const raw = await readFile(join(cwd, '.vercel', 'project.json'), 'utf-8');
     const parsed = JSON.parse(raw);
-    if (parsed?.projectId) {
-      return { projectId: parsed.projectId, orgId: parsed.orgId ?? null, source: 'project.json' };
+    const project = normalizeLinkedProject(parsed, 'project.json');
+    if (project) {
+      return { source: 'project.json', projects: [project] };
     }
   } catch { /* fall through */ }
 
+  return { source: null, projects: [] };
+}
+
+export async function readProjectJson(cwd = process.cwd(), opts = {}) {
+  const linked = await readLinkedProjects(cwd);
+  if (linked.projects.length === 0) return null;
+  if (opts.projectId) {
+    return linked.projects.find((p) => p.projectId === opts.projectId) ?? null;
+  }
+  if (linked.projects.length === 1) return linked.projects[0];
   return null;
 }
 
 // Does NOT auto-run `vercel link` — interactive surprises bad.
 export async function resolveProjectId(explicit, cwd = process.cwd()) {
-  if (explicit) {
+  const linked = await readLinkedProjects(cwd);
+  const explicitProjectId = explicit || null;
+  const envProjectId = process.env.VERCEL_PROJECT_ID || null;
+  const envOrgId = process.env.VERCEL_ORG_ID || null;
+  const requestedProjectId = explicitProjectId || envProjectId || null;
+  const inputSource = explicitProjectId ? 'arg' : envProjectId ? 'env' : null;
+  const choices = linked.projects.map(scopeChoice);
+
+  const blocked = (blocker, detail, extra = {}) => ({
+    ok: false,
+    blocker,
+    detail,
+    source: linked.source ?? inputSource ?? null,
+    projectId: requestedProjectId,
+    orgId: envOrgId,
+    inputProjectId: requestedProjectId,
+    inputProjectIdSource: inputSource,
+    choices,
+    ...extra,
+  });
+
+  if (linked.projects.length === 0) {
+    return blocked(
+      'not_linked',
+      requestedProjectId
+        ? 'This directory is not linked to a Vercel project. Passing a project ID alone is not enough for route-level metrics because the CLI also resolves project context from the linked cwd.'
+        : 'This directory is not linked to a Vercel project.'
+    );
+  }
+
+  let selected = null;
+  if (requestedProjectId) {
+    selected = linked.projects.find((p) => p.projectId === requestedProjectId) ?? null;
+    if (!selected) {
+      return blocked(
+        'project_link_mismatch',
+        'The requested project does not match the Vercel project linked in this directory. Use the directory linked to that project, or relink this directory before collecting metrics.',
+        { linkedProjectCount: linked.projects.length }
+      );
+    }
+  } else if (linked.projects.length === 1) {
+    selected = linked.projects[0];
+  } else {
+    return blocked(
+      'ambiguous_project',
+      'This directory is linked to multiple Vercel projects. The skill cannot safely choose one automatically.',
+      { linkedProjectCount: linked.projects.length }
+    );
+  }
+
+  if (envOrgId && selected.orgId && envOrgId !== selected.orgId) {
+    return blocked(
+      'team_scope_conflict',
+      'VERCEL_ORG_ID does not match the linked project team. Unset VERCEL_ORG_ID or relink the directory before collecting metrics.',
+      { selected: scopeChoice(selected) }
+    );
+  }
+
+  if (!selected.orgId) {
+    return blocked(
+      'team_scope_missing',
+      'The linked project did not include a team ID. VERCEL_ORG_ID cannot be used to infer it because the skill cannot verify that environment value against the linked project.',
+      { selected: scopeChoice(selected) }
+    );
+  }
+
+  return {
+    ...selected,
+    ok: true,
+    orgId: selected.orgId ?? envOrgId,
+    inputProjectId: requestedProjectId,
+    inputProjectIdSource: inputSource,
+    choices: [scopeChoice(selected)],
+  };
+}
+
+export async function resolveTeamScope(orgId) {
+  if (!orgId) {
+    return { ok: false, blocker: 'team_scope_missing', detail: 'No team ID was available for Vercel CLI scoping.' };
+  }
+  if (!/^team_[A-Za-z0-9]+$/.test(orgId)) {
+    return { ok: true, orgId, cliScope: orgId, source: 'org-id-as-scope' };
+  }
+  const r = await runVercelJson(['teams', 'list', '--format', 'json']);
+  if (!r.ok) {
     return {
-      projectId: explicit,
-      orgId: process.env.VERCEL_ORG_ID || null,
-      source: 'arg',
+      ok: false,
+      blocker: 'team_scope_unresolved',
+      detail: 'Could not resolve a team slug for the linked team; Vercel CLI subcommands may otherwise use the global currentTeam.',
+      code: r.code,
+      stderr: r.stderr,
     };
   }
-  if (process.env.VERCEL_PROJECT_ID) {
+  const teams = Array.isArray(r.data)
+    ? r.data
+    : Array.isArray(r.data?.teams)
+      ? r.data.teams
+      : Array.isArray(r.data?.data)
+        ? r.data.data
+        : [];
+  const team = teams.find((t) => String(t?.id ?? '') === orgId);
+  const slug = team?.slug ?? null;
+  if (!slug) {
     return {
-      projectId: process.env.VERCEL_PROJECT_ID,
-      orgId: process.env.VERCEL_ORG_ID || null,
-      source: 'env',
+      ok: false,
+      blocker: 'team_scope_unresolved',
+      detail: 'Could not find the linked team in `vercel teams list --format json`. Ask the user to confirm the team slug before collecting metrics.',
     };
   }
-  return await readProjectJson(cwd);
+  return { ok: true, orgId, cliScope: slug, source: 'teams-list' };
+}
+
+function normalizeLinkedProject(project, source) {
+  if (typeof project === 'string') {
+    return { projectId: project, orgId: null, orgSlug: null, name: null, rootDirectory: null, source };
+  }
+  const projectId = project?.projectId ?? project?.id ?? null;
+  if (!projectId) return null;
+  return {
+    projectId,
+    orgId: project.orgId ?? project.teamId ?? project.accountId ?? null,
+    orgSlug: project.orgSlug ?? project.teamSlug ?? null,
+    name: project.name ?? project.projectName ?? null,
+    rootDirectory: project.rootDirectory ?? project.rootDir ?? project.directory ?? null,
+    source,
+  };
+}
+
+function normalizeRepoProjects(projects, defaults = {}) {
+  if (Array.isArray(projects)) {
+    return projects.map((p) => withLinkedDefaults(normalizeLinkedProject(p, 'repo.json'), defaults)).filter(Boolean);
+  }
+  if (projects && typeof projects === 'object') {
+    return Object.entries(projects)
+      .map(([rootDirectory, value]) => {
+        const raw = value && typeof value === 'object'
+          ? { rootDirectory, ...value }
+          : { projectId: value, rootDirectory };
+        return withLinkedDefaults(normalizeLinkedProject(raw, 'repo.json'), defaults);
+      })
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function withLinkedDefaults(project, defaults = {}) {
+  if (!project) return null;
+  return {
+    ...project,
+    orgId: project.orgId ?? defaults.orgId ?? null,
+    orgSlug: project.orgSlug ?? defaults.orgSlug ?? null,
+  };
+}
+
+function scopeChoice(project) {
+  if (!project) return null;
+  return {
+    projectId: project.projectId,
+    orgId: project.orgId ?? null,
+    orgSlug: project.orgSlug ?? null,
+    name: project.name ?? null,
+    rootDirectory: project.rootDirectory ?? null,
+    source: project.source ?? null,
+  };
 }
 
 // Some commands emit `{error: {...}}` on stdout AND exit non-zero — parse stdout first; embedded `error` is the most reliable signal.
@@ -152,7 +316,8 @@ export function redactSensitiveText(value) {
 function categorizeError(exitCode, stderr) {
   const lc = (stderr || '').toLowerCase();
   if (isDailyQuotaExceeded({ ok: false, stderr })) return 'DAILY_QUOTA_EXCEEDED';
-  if (lc.includes('observability plus')) return 'OPLUS_REQUIRED';
+  if (mentionsObservabilityPlusNotEnabled(lc)) return 'OPLUS_REQUIRED';
+  if (/payment required[\s\S]{0,160}observability plus/.test(lc) || /observability plus[\s\S]{0,160}payment required/.test(lc)) return 'PAYMENT_REQUIRED';
   if (lc.includes('costs not found')) return 'USAGE_UNAVAILABLE';
   if (lc.includes('project not found')) return 'PROJECT_NOT_FOUND';
   if (lc.includes('not linked') || lc.includes('no project')) return 'NOT_LINKED';
@@ -163,9 +328,46 @@ function categorizeError(exitCode, stderr) {
   return `EXIT_${exitCode}`;
 }
 
+export function mentionsObservabilityPlusNotEnabled(text) {
+  const value = String(text ?? '').toLowerCase();
+  return (
+    /observability plus[\s\S]{0,160}not enabled/.test(value) ||
+    /observability plus[\s\S]{0,160}disabled/.test(value) ||
+    /not enabled[\s\S]{0,160}observability plus/.test(value) ||
+    /disabled[\s\S]{0,160}observability plus/.test(value) ||
+    /(does\s+not|doesn't|do\s+not|don't|did\s+not|didn't)[\s\S]{0,80}(have\s+)?observability plus[\s\S]{0,80}enabled/.test(value) ||
+    /(has|have)\s+not[\s\S]{0,80}enabled[\s\S]{0,80}observability plus/.test(value) ||
+    /subscription to observability plus[\s\S]{0,160}required/.test(value)
+  );
+}
+
+export function classifyObservabilityPlusAccessText(text) {
+  const value = String(text ?? '').toLowerCase();
+  if (!mentionsObservabilityPlusNotEnabled(value)) return null;
+  const projectScoped =
+    /project[\s\S]{0,160}(observability plus[\s\S]{0,160})?(not enabled|disabled)/.test(value) ||
+    /project[\s\S]{0,160}(does\s+not|doesn't|do\s+not|don't|did\s+not|didn't|has\s+not|have\s+not)[\s\S]{0,160}observability plus[\s\S]{0,160}enabled/.test(value) ||
+    /(not enabled|disabled)[\s\S]{0,160}(for|on)\s+(this\s+)?project/.test(value) ||
+    /observability plus[\s\S]{0,160}(not enabled|disabled)[\s\S]{0,160}project/.test(value);
+  return projectScoped ? 'project_disabled' : 'oplus_not_enabled';
+}
+
 // Schema is global per team — pass scope so we hit the right team rather than user's currentTeam.
-export async function hasObservabilityPlus(scope) {
+export async function probeObservabilityPlusSchema(scope) {
   const r = await runVercelJson(scopedArgs(['metrics', 'schema', '--format', 'json'], scope));
+  if (r.ok) return { ok: true, access: true, data: r.data, code: null, source: 'metrics-schema' };
+  const text = `${r.message ?? ''}\n${r.stderr ?? ''}`;
+  const blocker = classifyObservabilityPlusAccessText(text);
+  return {
+    ...r,
+    access: blocker ? false : null,
+    blocker: blocker ?? 'oplus_probe_failed',
+    source: 'metrics-schema',
+  };
+}
+
+export async function hasObservabilityPlus(scope) {
+  const r = await probeObservabilityPlusSchema(scope);
   return r.ok;
 }
 
@@ -220,17 +422,16 @@ export function classifyObservabilityPlusConfiguration(result, { projectId } = {
 
   const code = String(result?.code ?? 'unknown').toLowerCase();
   const text = `${result?.message ?? ''}\n${result?.stderr ?? ''}`.toLowerCase();
-  const mentionsObservabilityPlusNotEnabled =
-    /observability plus[\s\S]{0,160}not enabled/.test(text) ||
-    /not enabled[\s\S]{0,160}observability plus/.test(text) ||
-    /subscription to observability plus[\s\S]{0,160}required/.test(text);
-  if (code === 'oplus_required' || ((code === 'not_found' || code === '404') && mentionsObservabilityPlusNotEnabled)) {
+  const accessBlocker = classifyObservabilityPlusAccessText(text);
+  if ((code === 'oplus_required' && accessBlocker) || ((code === 'not_found' || code === '404') && accessBlocker)) {
     return {
       ok: true,
       source,
       access: false,
-      blocker: 'no_oplus_probe',
-      detail: 'Route-level metrics are unavailable because Observability Plus is not enabled for this team.',
+      blocker: accessBlocker,
+      detail: accessBlocker === 'project_disabled'
+        ? 'The metrics API reported that Observability Plus is not enabled for this project.'
+        : 'The metrics API reported that Observability Plus is not enabled for the current Vercel scope.',
     };
   }
   if (/forbidden|not_authorized|403/.test(code) || /forbidden|not authorized|permission|403/.test(text)) {
@@ -269,6 +470,7 @@ export async function queryMetric(metricId, opts = {}) {
   if (opts.since) args.push('--since', opts.since);
   if (opts.until) args.push('--until', opts.until);
   if (opts.limit) args.push('--limit', String(opts.limit));
+  if (opts.projectId) args.push('--project', opts.projectId);
 
   // 3-layer protection: semaphore (8 concurrent) + sliding-window (80/60s) + retryOnRateLimit (3× 60-90s jitter). payment_required is terminal.
   const throttle = getMetricThrottle();
@@ -506,12 +708,8 @@ async function pathExists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
-// `--scope <teamId>` is buggy on several subcommands (silently falls back to currentTeam) — only pass slugs.
 function scopedArgs(args, scope) {
   if (!scope) return args;
-  if (typeof scope === 'string' && /^team_[A-Za-z0-9]+$/.test(scope)) {
-    return args;
-  }
   return [...args, '--scope', scope];
 }
 

@@ -55,6 +55,7 @@ test('public release safety: public docs do not imply project ID replaces linkag
     const text = await readFile(file, 'utf8');
     assert.doesNotMatch(text, /Linked Vercel project(?:,| directory) or `VERCEL_PROJECT_ID`/, file);
     assert.doesNotMatch(text, /Linked Vercel project, or `VERCEL_PROJECT_ID`/, file);
+    assert.match(text, /vercel link --repo|repo root from `vercel link --repo`/, file);
   }
 });
 

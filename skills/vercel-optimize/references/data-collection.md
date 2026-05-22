@@ -14,7 +14,7 @@ All shapes here are covered by sanitized CLI fixtures in `packages/vercel-optimi
 
 ## The `signals.json` shape
 
-`node scripts/collect-signals.mjs` emits the Vercel-side signal document. `node scripts/scan-codebase.mjs <repo-root>` emits the local codebase scan. `node scripts/merge-signals.mjs vercel-signals.json codebase.json --out signals.json` combines them into the artifact consumed by the gate, deep-dive, verifier, and renderer. The merge step also annotates scanner findings with route-level observability, `COLD-PATH`, or `NO-ROUTE-MAPPING`; scanner gates reject non-traffic-independent findings that do not carry one of those deterministic annotations.
+`node scripts/collect-signals.mjs` emits the Vercel-side signal document. Check `scopeBlocker`, `frameworkSupportBlocker`, and `observabilityPlusBlocker` in that file before scanning source; unresolved project/team scope or metrics access must pause the workflow before scanner-only mode. `node scripts/scan-codebase.mjs <repo-root>` emits the local codebase scan. `node scripts/merge-signals.mjs vercel-signals.json codebase.json --out signals.json` combines them into the artifact consumed by the gate, deep-dive, verifier, and renderer. The merge step also annotates scanner findings with route-level observability, `COLD-PATH`, or `NO-ROUTE-MAPPING`; scanner gates reject non-traffic-independent findings that do not carry one of those deterministic annotations.
 
 The merged `signals.json` has this top-level shape:
 
@@ -25,7 +25,21 @@ The merged `signals.json` has this top-level shape:
   "timeWindow": "14d",
   "projectId": "prj_xxx",
   "orgId": "team_xxx",
-  "projectIdSource": "repo.json" | "project.json" | "arg" | "env",
+  "projectIdSource": "repo.json" | "project.json",
+  "scopeResolution": {
+    "ok": true,
+    "projectId": "prj_xxx",
+    "orgId": "team_xxx",
+    "orgSlug": "team-slug-or-null",
+    "cliScope": "team-slug-used-for-cli-subcommands",
+    "projectName": "project-name-or-null",
+    "projectIdSource": "repo.json" | "project.json",
+    "inputProjectId": "optional-prj_xxx-from-argv-or-env",
+    "inputProjectIdSource": "arg" | "env" | null
+  },
+  "scopeBlocker": null | "not_linked" | "ambiguous_project" | "project_link_mismatch" | "team_scope_conflict" | "team_scope_missing" | "team_scope_unresolved",
+  "scopeBlockerDetail": "...",
+  "scopeChoices": [ /* candidate linked projects shown to the user when scopeBlocker is set */ ],
   "frameworkSupport": {
     "ok": true,
     "status": "supported" | "limited" | "unsupported",
@@ -39,7 +53,7 @@ The merged `signals.json` has this top-level shape:
   "observabilityPlus": true | false | null,
   "observabilityPlusPreflight": { /* CLI/API configuration probe result */ },
   "observabilityPlusUsable": true | false | null,
-  "observabilityPlusBlocker": null | "no_oplus_probe" | "project_disabled" | "payment_required" | "forbidden" | "daily_quota_exceeded" | "project_not_found" | "not_linked" | "all_failed_other" | "no_traffic",
+  "observabilityPlusBlocker": null | "oplus_not_enabled" | "oplus_probe_failed" | "project_disabled" | "payment_required" | "forbidden" | "daily_quota_exceeded" | "project_not_found" | "not_linked" | "all_failed_other" | "no_traffic",
   "observabilityPlusBlockerDetail": "...",
   "plan": { "plan": "pro" | "enterprise" | "uncertain", "reason": "..." },
   "project": { /* /v9/projects/:id response, scoped to orgId via ?teamId */ },
@@ -57,20 +71,28 @@ All metric queries use the same `timeWindow` constant (`14d`) — defined as `TI
 
 Downstream consumers reference `signals.<field>` paths verbatim. Bumping `schemaVersion` is required when any consumed path is renamed or removed.
 
+## Scope safety
+
+The skill must never infer a Vercel project by position. When `.vercel/repo.json` contains multiple projects, whether as an array or a directory-to-project map, collection stops with `scopeBlocker="ambiguous_project"` unless argv or `VERCEL_PROJECT_ID` exactly matches one linked project. If argv or `VERCEL_PROJECT_ID` names a different project than the linked cwd, collection stops with `scopeBlocker="project_link_mismatch"` because route-level metrics still depend on cwd project linkage.
+
+`VERCEL_ORG_ID` can confirm the linked team, but it cannot override the team in `.vercel/project.json` or `.vercel/repo.json`, and it cannot fill in a missing linked team. A mismatch stops collection with `scopeBlocker="team_scope_conflict"`; a link with no team stops with `scopeBlocker="team_scope_missing"`.
+
+For CLI commands that accept global `--scope`, the collector resolves the linked team ID to a team slug with `vercel teams list --format json`, then uses that slug for `vercel contract`, `vercel usage`, `vercel metrics schema`, and every `vercel metrics` query. Every route-level metric query also passes `--project <projectId>` so a wrong global `currentTeam` cannot silently select a different project.
+
 ## Per-signal source matrix
 
 | Signal | CLI command | Required for | Fallback when missing |
 |---|---|---|---|
 | Auth | `vercel whoami` | Everything | Exit with "run `vercel login`" |
 | CLI version | `vercel --version` | Everything | Exit with "upgrade to v53+" — v53 is the skill's compatibility floor |
-| Project ID + Org ID | `.vercel/repo.json` (newer) or `.vercel/project.json` (legacy) → `VERCEL_PROJECT_ID` + `VERCEL_ORG_ID` → argv | Everything | Exit with "run `vercel link` or pass projectId" |
+| Project/team scope | `.vercel/repo.json` (newer, project array or map) or `.vercel/project.json` (legacy), optionally matched against argv or `VERCEL_PROJECT_ID`; `VERCEL_ORG_ID` may only confirm, not override or infer, the linked team | Everything | Emit `scopeBlocker` and stop before framework, usage, or metric collection |
 | Framework support | local `package.json` via `detectStack()` + `classifyFrameworkSupport()` | Code-backed route recommendations | Stop before metric fan-out on unsupported frameworks unless the user chooses `--continue-unsupported-framework` |
-| Observability Plus configuration | Vercel CLI/API probe plus one metric access check | All `metrics.*` signals | Stop early when the team lacks Observability Plus or this project is disabled |
-| Observability Plus metrics access | One canary `vercel metrics vercel.request.count --since 14d --limit 1`, then full fan-out only if it succeeds | All `metrics.*` signals | Set `observabilityPlusUsable=false` with blocker detail; emit a minimal blocker document before slower project config / usage collection unless `--continue-without-observability` is passed |
+| Observability Plus configuration | Vercel CLI/API probe plus one metric access check | All `metrics.*` signals | Stop early when Vercel reports Observability Plus is unavailable for the current scope or disabled for this project |
+| Observability Plus metrics access | One canary `vercel metrics vercel.request.count --project <projectId> --scope <teamSlug> --since 14d --limit 1`, then full fan-out only if it succeeds | All `metrics.*` signals | Set `observabilityPlusUsable=false` with blocker detail; emit a minimal blocker document before slower project config / usage collection unless `--continue-without-observability` is passed |
 | Project config | `vercel api /v9/projects/:id?teamId=<orgId>` | Fluid Compute, BotID, Speed Insights, security flags | `{error: "..."}` placeholder; gates that need it skip |
-| Plan tier | `vercel contract --format json --scope <orgId>` → `inferPlan()` | Cost-context framing only | `plan="uncertain"`; cost magnitudes still computed from `usage.services[].billedCost` |
-| Billing usage | `vercel usage --format json --from <14d> --to <today>` with best-effort project grouping when supported by the installed CLI | Cost magnitude framing, billing-driven candidates | `null` + `usageError` set; cost magnitudes degrade to "small" by default |
-| Stack | local `package.json` + dir scan | Version-aware citation filtering, scanner gating | "unknown" framework → all framework-specific citations filtered |
+| Plan tier | `vercel contract --format json --scope <teamSlug>` → `inferPlan()` | Cost-context framing only | `plan="uncertain"`; cost magnitudes still computed from `usage.services[].billedCost` |
+| Billing usage | `vercel usage --format json --scope <teamSlug> --from <14d> --to <today>` with best-effort project grouping when supported by the installed CLI | Cost magnitude framing, billing-driven candidates | `null` + `usageError` set; cost magnitudes degrade to "small" by default |
+| Stack | selected linked project's `rootDirectory` when present, otherwise cwd `package.json` + dir scan | Version-aware citation filtering, scanner gating | "unknown" framework → all framework-specific citations filtered |
 | `metrics.fnDurationP95ByRoute` | `vercel metrics vercel.function_invocation.function_duration_ms -a p95 --group-by route --since 14d` | `slow_route`, `platform_fluid_compute` gates | `{ok:false}`; gate emits no candidates |
 | `metrics.requestsByRouteCache` | `vercel metrics vercel.request.count --group-by route --group-by cache_result --since 14d` | `uncached_route`, traffic-total computation | `{ok:false}` |
 | `metrics.fnStatusByRoute` | `vercel metrics vercel.function_invocation.count --group-by route --group-by http_status --since 14d` | Canonical function-level 5xx source for `route_errors` and `slow_route` error disqualification | `{ok:false}`; fall back to `requestsByRouteStatus` only for older fixtures |
@@ -103,8 +125,14 @@ Downstream consumers reference `signals.<field>` paths verbatim. Bumping `schema
 
 | Code | Meaning | Skill behavior |
 |---|---|---|
+| `not_linked` | The cwd has no `.vercel/project.json` or `.vercel/repo.json`; a project ID alone is not enough for route metrics | Stop before framework, usage, or metric collection; ask the user to link the exact app directory with the target project and team |
+| `ambiguous_project` | `.vercel/repo.json` contains multiple linked projects and no explicit project ID selected one | Stop before collection; show `scopeChoices` and ask which team/project to audit |
+| `project_link_mismatch` | argv or `VERCEL_PROJECT_ID` does not match the project linked in this cwd | Stop before collection; ask the user to switch to the correct app directory or relink this directory |
+| `team_scope_conflict` | `VERCEL_ORG_ID` conflicts with the team in the linked project file | Stop before collection; ask the user to unset the env var or relink/switch to the intended team |
+| `team_scope_missing` / `team_scope_unresolved` | The skill cannot derive a safe CLI scope from the linked team; environment values are not enough when the link itself has no team | Stop before collection; ask the user to confirm the team slug or rerun `vercel link --team <team-id-or-slug>` |
 | `unsupported_framework` | Detected framework cannot reliably map Vercel route metrics back to source files | Stop before metric fan-out; ask whether to continue with a limited platform/scanner audit |
-| `no_oplus_probe` | Observability Plus not enabled on team | Stop before full metric fan-out; ask whether to enable Observability Plus or run scanner-only |
+| `oplus_not_enabled` | Vercel reported Observability Plus is not enabled for the current team/project scope | Stop before full metric fan-out; ask whether to enable Observability Plus or run scanner-only |
+| `oplus_probe_failed` | The skill could not confirm route-level metric access from the current CLI/project context | Stop before full metric fan-out; ask the user to verify link/team/auth context or share `collect.stderr`; do not claim Observability Plus is disabled |
 | `project_disabled` | Observability Plus enabled for team but disabled for project | Stop before full metric fan-out; ask the user to enable Observability Plus for this project or continue scanner-only |
 | `daily_quota_exceeded` | Observability Plus query quota is exhausted for the day | Stop before full metric fan-out; tell the user to retry after the next UTC midnight reset or ask whether to continue scanner-only |
 | `USAGE_UNAVAILABLE` | `vercel usage` 404 — team has no Costs feature enabled | `usage=null`; cost-tier gates emit lower-priority candidates; billing section of the report shows "unavailable" |

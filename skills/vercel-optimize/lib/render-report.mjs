@@ -17,7 +17,6 @@ export function renderReport({ recommendations = [], gated = [], abstentions = [
   const projectName = opts.projectName ?? signals.project?.name ?? '<project>';
   const stack = signals.stack ?? signals.codebase?.stack ?? {};
   const usage = signals.usage ?? null;
-  const oplus = signals.observabilityPlus !== false;
   const plan = signals.plan ?? { plan: 'unknown', reason: '(not detected)' };
 
   // Sub-agents don't always propagate o11ySignal/aliasRoutes — look them up by candidateRef and canonicalize the displayed ref.
@@ -27,7 +26,7 @@ export function renderReport({ recommendations = [], gated = [], abstentions = [
   const lines = [];
   lines.push(`# Vercel Optimization Report — ${projectName}`);
   lines.push('');
-  lines.push(renderMetadataLine(stack, plan, usage, oplus));
+  lines.push(renderMetadataLine(stack, plan, usage, signals));
   const coverageLine = renderCoverageLine(candidates, recommendations, signals, {
     abstentions,
     heldBackCount: opts.heldBackCount,
@@ -307,7 +306,7 @@ function renderCoverageLine(candidates, recommendations, signals, opts = {}) {
   return `**Coverage**: ${parts.join('  ·  ')} · [details](#not-investigated-in-this-run)`;
 }
 
-function renderMetadataLine(stack, plan, usage, oplus) {
+function renderMetadataLine(stack, plan, usage, signals) {
   const fw = `${stack.framework ?? 'unknown'}@${stack.frameworkVersion ?? '?'}`;
   const router = stack.hasAppRouter ? 'app-router' : stack.hasPagesRouter ? 'pages-router' : null;
   const orm = stack.orm && stack.orm !== 'none' ? stack.orm : null;
@@ -315,14 +314,32 @@ function renderMetadataLine(stack, plan, usage, oplus) {
   const period = usage?.period
     ? `${usage.period.from ?? '?'} → ${usage.period.to ?? '?'}`
     : '(unavailable)';
-  const oplusLabel = oplus
-    ? 'Observability Plus enabled — per-route metrics included'
-    : 'Not enabled — analysis based on billing + scanner findings';
   // Plan-inference reason is debug detail — only surface when plan is uncertain.
   const planLabel = plan.plan === 'uncertain'
     ? `${plan.plan} (${plan.reason ?? 'no signal'})`
     : (plan.plan ?? 'unknown');
-  return `**Stack**: ${stackParts}  ·  **Plan**: ${planLabel}  ·  **Period**: ${period}  ·  **Observability**: ${oplusLabel}`;
+  return `**Stack**: ${stackParts}  ·  **Plan**: ${planLabel}  ·  **Period**: ${period}  ·  **Observability**: ${renderObservabilityMetadata(signals)}`;
+}
+
+function observabilityMetricsIncluded(signals) {
+  if (signals.scopeBlocker) return false;
+  if (signals.observabilityPlusBlocker) return false;
+  if (signals.observabilityPlusUsable === true) return true;
+  if (signals.observabilityPlusUsable === false) return false;
+  if (signals.observabilityPlus === true) return true;
+  if (signals.observabilityPlus === false) return false;
+  return false;
+}
+
+function renderObservabilityMetadata(signals) {
+  if (signals.scopeBlocker) return 'Project/team scope unresolved — analysis cannot use Vercel metrics';
+  const blocker = signals.observabilityPlusBlocker;
+  if (observabilityMetricsIncluded(signals)) return 'Observability Plus enabled — per-route metrics included';
+  if (blocker === 'oplus_not_enabled') return 'Observability Plus not enabled — analysis based on billing + scanner findings';
+  if (blocker === 'project_disabled') return 'Observability Plus disabled for this project — analysis based on billing + scanner findings';
+  if (blocker === 'oplus_probe_failed') return 'Per-route metrics probe failed — analysis based on billing + scanner findings';
+  if (blocker === 'no_traffic') return 'Observability Plus enabled — no route traffic in this window';
+  return 'Per-route metrics unavailable — analysis based on billing + scanner findings';
 }
 
 function renderCostHeader(signals) {
@@ -660,7 +677,8 @@ function renderConfigurationNotes(signals) {
 
 function renderDataGaps(signals) {
   const lines = [];
-  if (signals.observabilityPlus === false) lines.push('- Observability Plus not enabled — per-route latency / cache-hit / cold-start metrics unavailable.');
+  const observabilityGap = renderObservabilityDataGap(signals);
+  if (observabilityGap) lines.push(observabilityGap);
   if (!signals.usage) lines.push('- `vercel usage` was unavailable — cost breakdown derived from observability where possible.');
   const cwv = signals.metrics?.cwvCount?.rows?.[0]?.value ?? 0;
   if (cwv === 0) lines.push('- No Speed Insights measurements — Core Web Vitals analysis dormant. Wire up Speed Insights to enable LCP/INP/CLS recommendations.');
@@ -672,6 +690,36 @@ function renderDataGaps(signals) {
   if (middleware.length === 0) lines.push('- No middleware invocations — either no `middleware.ts` is shipped or its matcher excludes all observed traffic.');
   if (lines.length === 0) lines.push('_(no relevant gaps — every signal had data)_');
   return lines;
+}
+
+function renderObservabilityDataGap(signals) {
+  if (observabilityMetricsIncluded(signals)) return null;
+  if (signals.scopeBlocker) {
+    const reason = signals.scopeBlockerDetail ? formatPublicText(signals.scopeBlockerDetail) : formatPublicText(signals.scopeBlocker);
+    return `- Project/team scope unresolved — Vercel usage and route metrics were not collected (${reason}).`;
+  }
+  const blocker = signals.observabilityPlusBlocker;
+  const detail = signals.observabilityPlusBlockerDetail;
+  if (blocker === 'oplus_not_enabled') {
+    return '- Observability Plus not enabled — per-route latency / cache-hit / cold-start metrics unavailable.';
+  }
+  if (blocker === 'project_disabled') {
+    return '- Observability Plus is disabled for this project — per-route latency / cache-hit / cold-start metrics unavailable.';
+  }
+  if (blocker === 'oplus_probe_failed') {
+    return `- Per-route metrics probe failed — route latency / cache-hit / cold-start analysis was skipped${detail ? ` (${formatPublicText(detail)})` : '.'}`;
+  }
+  if (blocker === 'no_traffic') {
+    return '- No route traffic observed in the metrics window — route ranking is dormant until traffic accumulates.';
+  }
+  if (blocker) {
+    const reason = detail ? formatPublicText(detail) : formatPublicText(blocker);
+    return `- Per-route metrics unavailable — route latency / cache-hit / cold-start analysis was skipped (${reason}).`;
+  }
+  if (signals.observabilityPlus === false) {
+    return '- Per-route metrics unavailable — route latency / cache-hit / cold-start analysis was skipped.';
+  }
+  return '- Per-route metrics unavailable — route latency / cache-hit / cold-start analysis was skipped.';
 }
 
 function sortRecs(recs) {

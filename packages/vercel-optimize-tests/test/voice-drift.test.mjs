@@ -41,22 +41,22 @@ test('voice drift: no markdown file uses Observability Plus shorthand', async ()
 
 test('voice drift: Observability Plus blocker question uses exact plain copy', async () => {
   const content = await readFile(join(ROOT, 'references', 'observability-plus.md'), 'utf-8');
-  assert.match(content, /"header": "Observability Plus"/);
+  assert.match(content, /"header": "Metrics access"/);
   assert.match(
     content,
-    /"question": "Enable Observability Plus and re-run, or continue with a limited scanner-only audit\?"/
+    /"question": "Fix per-route metrics access and re-run, or continue with a limited scanner-only audit\?"/
   );
-  assert.match(content, /"label": "Enable and re-run"/);
+  assert.match(content, /"label": "Fix and re-run"/);
   assert.match(content, /"label": "Run scanner-only"/);
   assert.doesNotMatch(content, /\b(O11y|OPlus|Oplus|O-Plus|perf|CWV)\b|obs\+/);
 });
 
 test('voice drift: Observability Plus post-choice copy avoids IDs and pricing language', async () => {
   const content = await readFile(join(ROOT, 'references', 'observability-plus.md'), 'utf-8');
-  assert.match(content, /If the user chooses \*\*Enable and re-run\*\*/);
+  assert.match(content, /If the user chooses \*\*Fix and re-run\*\*/);
   assert.match(
     content,
-    /Enable Observability Plus from the Vercel dashboard's Observability tab, then tell me to rerun\./
+    /Fix per-route metrics access, then tell me to rerun\./
   );
   assert.match(content, /Do not include raw team IDs, org IDs, project IDs, pricing language/);
   assert.doesNotMatch(content, /paid add-on|paid feature|just say the word/i);

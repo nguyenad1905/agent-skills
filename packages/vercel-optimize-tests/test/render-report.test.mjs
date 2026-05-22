@@ -270,10 +270,63 @@ test('renderReport: handles missing observabilityPlus gracefully', () => {
   const md = renderReport({
     recommendations: [],
     gated: [],
-    signals: { ...baseSignals, observabilityPlus: false },
+    signals: {
+      ...baseSignals,
+      observabilityPlus: false,
+      observabilityPlusBlocker: 'oplus_not_enabled',
+      observabilityPlusBlockerDetail: 'The metrics API reported that Observability Plus is not enabled for the current Vercel scope.',
+    },
   });
-  assert.match(md, /Not enabled — analysis based on billing \+ scanner findings/);
+  assert.match(md, /Observability Plus not enabled — analysis based on billing \+ scanner findings/);
   assert.match(md, /Observability Plus not enabled/);
+});
+
+test('renderReport: inconclusive Observability probe does not claim Observability Plus is disabled', () => {
+  const md = renderReport({
+    recommendations: [],
+    gated: [],
+    signals: {
+      ...baseSignals,
+      observabilityPlus: false,
+      observabilityPlusUsable: false,
+      observabilityPlusBlocker: 'oplus_probe_failed',
+      observabilityPlusBlockerDetail: '`vercel metrics schema` returned non-OK. This does not prove Observability Plus is disabled.',
+    },
+  });
+  assert.match(md, /Per-route metrics probe failed/);
+  assert.doesNotMatch(md, /Not enabled — analysis based/);
+  assert.doesNotMatch(md, /Observability Plus not enabled/);
+});
+
+test('renderReport: missing Observability fields do not imply metrics were included', () => {
+  const { observabilityPlus, observabilityPlusUsable, observabilityPlusBlocker, ...signals } = baseSignals;
+  const md = renderReport({
+    recommendations: [],
+    gated: [],
+    signals,
+  });
+
+  assert.match(md, /Per-route metrics unavailable — analysis based on billing \+ scanner findings/);
+  assert.match(md, /Per-route metrics unavailable — route latency \/ cache-hit \/ cold-start analysis was skipped/);
+  assert.doesNotMatch(md, /Observability Plus enabled — per-route metrics included/);
+});
+
+test('renderReport: unresolved project scope does not claim metrics were included', () => {
+  const md = renderReport({
+    recommendations: [],
+    gated: [],
+    signals: {
+      ...baseSignals,
+      scopeBlocker: 'ambiguous_project',
+      scopeBlockerDetail: 'This directory is linked to multiple Vercel projects.',
+      observabilityPlus: null,
+      observabilityPlusUsable: null,
+      observabilityPlusBlocker: null,
+    },
+  });
+  assert.match(md, /Project\/team scope unresolved — analysis cannot use Vercel metrics/);
+  assert.match(md, /Project\/team scope unresolved — Vercel usage and route metrics were not collected/);
+  assert.doesNotMatch(md, /Observability Plus enabled — per-route metrics included/);
 });
 
 test('renderReport: hides sanitizerTrail by default and does not emit generic review notes', () => {

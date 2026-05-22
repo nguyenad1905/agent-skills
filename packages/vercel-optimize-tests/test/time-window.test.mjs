@@ -34,3 +34,12 @@ test('collect-signals.mjs: passes TIME_WINDOW (not a string literal) to queryMet
   assert.equal(literalSince, null,
     `collect-signals.mjs must not hard-pin since to a literal; found: ${literalSince}`);
 });
+
+test('metric query call sites pass explicit projectId to avoid currentTeam drift', async () => {
+  const collectSrc = await readFile(join(HERE, '..', '..', '..', 'skills', 'vercel-optimize', 'scripts', 'collect-signals.mjs'), 'utf-8');
+  const deepDiveSrc = await readFile(join(HERE, '..', '..', '..', 'skills', 'vercel-optimize', 'scripts', 'deep-dive.mjs'), 'utf-8');
+  assert.match(collectSrc, /queryMetric\('vercel\.request\.count'[\s\S]*projectId:\s*project\.projectId/);
+  assert.match(collectSrc, /queryMetric\(entry\.metricId[\s\S]*projectId,\s*\n/);
+  assert.match(deepDiveSrc, /const scope = merged\.scopeResolution\?\.cliScope \|\| merged\.orgId \|\| undefined/);
+  assert.match(deepDiveSrc, /queryMetric\(spec\.metricId[\s\S]*projectId:\s*merged\.projectId/);
+});

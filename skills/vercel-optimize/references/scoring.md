@@ -98,7 +98,7 @@ The agent renders this as the final output of Step 4. The shape is fixed; the co
 **Stack**: {framework}@{frameworkVersion} | {router} | {orm}
 **Plan**: {plan.plan} ({plan.reason})
 **Period**: {usage.period.from} → {usage.period.to}
-**Observability**: {observabilityPlus ? "Observability Plus enabled — per-route metrics included" : "Not enabled — analysis based on billing + scanner findings"}
+**Observability**: {blocker-specific label, e.g. "Observability Plus enabled — per-route metrics included", "Project/team scope unresolved — analysis cannot use Vercel metrics", "Observability Plus not enabled — analysis based on billing + scanner findings", or "Per-route metrics probe failed — analysis based on billing + scanner findings"}
 
 ## Cost breakdown
 
@@ -161,7 +161,7 @@ This section earns the user's trust. For every metric signal we considered but d
 
 ## Data gaps
 
-(what we couldn't measure — Observability Plus disabled means no per-route latency, etc.)
+(what we couldn't measure — missing or unavailable per-route metrics means no route-level latency/cache/cold-start ranking, etc.)
 ```
 
 Common data gaps to call out when the underlying metric returned empty rows:

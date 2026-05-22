@@ -6,10 +6,58 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { diagnoseObservabilityPlus } from '../../../skills/vercel-optimize/scripts/collect-signals.mjs';
 
-test('oplus diag: probe failed → no_oplus_probe', () => {
+test('oplus diag: probe failed → oplus_probe_failed without disabled claim', () => {
   const r = diagnoseObservabilityPlus({}, false);
   assert.equal(r.usable, false);
-  assert.equal(r.blocker, 'no_oplus_probe');
+  assert.equal(r.blocker, 'oplus_probe_failed');
+  assert.doesNotMatch(r.detail, /does not have Observability Plus enabled|not enabled/i);
+});
+
+test('oplus diag: schema probe generic failure → oplus_probe_failed without disabled claim', () => {
+  const r = diagnoseObservabilityPlus({}, {
+    ok: false,
+    access: null,
+    code: 'EXIT_1',
+    stderr: 'Failed to query Observability Plus configuration endpoint.',
+  });
+  assert.equal(r.usable, false);
+  assert.equal(r.blocker, 'oplus_probe_failed');
+  assert.match(r.detail, /code=EXIT_1/);
+  assert.doesNotMatch(r.detail, /not enabled/i);
+});
+
+test('oplus diag: generated inconclusive detail is not reclassified as disabled', () => {
+  const r = diagnoseObservabilityPlus({}, {
+    ok: false,
+    access: null,
+    code: 'EXIT_1',
+    detail: 'This does not prove Observability Plus is disabled.',
+  });
+  assert.equal(r.usable, false);
+  assert.equal(r.blocker, 'oplus_probe_failed');
+});
+
+test('oplus diag: schema probe project-level not-enabled response → project_disabled', () => {
+  const r = diagnoseObservabilityPlus({}, {
+    ok: false,
+    access: false,
+    code: 'OPLUS_REQUIRED',
+    stderr: 'Observability Plus is not enabled for this project.',
+  });
+  assert.equal(r.usable, false);
+  assert.equal(r.blocker, 'project_disabled');
+  assert.match(r.detail, /not enabled for this project/);
+});
+
+test('oplus diag: schema probe project disabled wording → project_disabled', () => {
+  const r = diagnoseObservabilityPlus({}, {
+    ok: false,
+    access: false,
+    code: 'OPLUS_REQUIRED',
+    stderr: 'This project does not have Observability Plus enabled.',
+  });
+  assert.equal(r.usable, false);
+  assert.equal(r.blocker, 'project_disabled');
 });
 
 test('oplus diag: queries all returned payment_required → payment_required blocker', () => {
@@ -27,7 +75,7 @@ test('oplus diag: queries all returned payment_required → payment_required blo
   assert.match(r.detail, /4\/4/);
 });
 
-test('oplus diag: payment_required with subscription-required text → no_oplus_probe', () => {
+test('oplus diag: payment_required with subscription-required text → oplus_not_enabled', () => {
   const metrics = {
     observabilityPlusCanary: {
       ok: false,
@@ -37,8 +85,22 @@ test('oplus diag: payment_required with subscription-required text → no_oplus_
   };
   const r = diagnoseObservabilityPlus(metrics, true);
   assert.equal(r.usable, false);
-  assert.equal(r.blocker, 'no_oplus_probe');
-  assert.match(r.detail, /route-level Observability Plus data/);
+  assert.equal(r.blocker, 'oplus_not_enabled');
+  assert.match(r.detail, /Observability Plus is not enabled/);
+});
+
+test('oplus diag: payment_required with project-not-enabled text → project_disabled', () => {
+  const metrics = {
+    observabilityPlusCanary: {
+      ok: false,
+      code: 'payment_required',
+      message: 'Observability Plus is not enabled for this project',
+    },
+  };
+  const r = diagnoseObservabilityPlus(metrics, true);
+  assert.equal(r.usable, false);
+  assert.equal(r.blocker, 'project_disabled');
+  assert.match(r.detail, /not enabled for this project/);
 });
 
 test('oplus diag: queries all hit daily quota → daily_quota_exceeded blocker', () => {
@@ -128,10 +190,11 @@ test('oplus diag: mixed success + daily quota → still usable when any query re
   assert.equal(r.blocker, null);
 });
 
-test('oplus diag: probe OK but no metrics attempted → no_oplus_probe (defensive)', () => {
+test('oplus diag: probe OK but no metrics attempted → oplus_probe_failed (defensive)', () => {
   const r = diagnoseObservabilityPlus({}, true);
   assert.equal(r.usable, false);
-  assert.equal(r.blocker, 'no_oplus_probe');
+  assert.equal(r.blocker, 'oplus_probe_failed');
+  assert.doesNotMatch(r.detail, /does not have Observability Plus enabled|not enabled/i);
 });
 
 test('oplus diag: unknown failure code falls back to all_failed_other', () => {

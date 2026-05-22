@@ -33,7 +33,7 @@ test('classifyObservabilityPlusConfiguration: project_disabled when this project
   });
 });
 
-test('classifyObservabilityPlusConfiguration: no_oplus_probe on public API not-enabled response', () => {
+test('classifyObservabilityPlusConfiguration: oplus_not_enabled on public API not-enabled response', () => {
   const r = classifyObservabilityPlusConfiguration({
     ok: false,
     code: 'not_found',
@@ -42,12 +42,13 @@ test('classifyObservabilityPlusConfiguration: no_oplus_probe on public API not-e
 
   assert.equal(r.ok, true);
   assert.equal(r.access, false);
-  assert.equal(r.blocker, 'no_oplus_probe');
-  assert.match(r.detail, /^Route-level metrics are unavailable/);
+  assert.equal(r.blocker, 'oplus_not_enabled');
+  assert.match(r.detail, /^The metrics API reported/);
   assert.match(r.detail, /not enabled/);
+  assert.match(r.detail, /current Vercel scope/);
 });
 
-test('classifyObservabilityPlusConfiguration: no_oplus_probe on CLI OPLUS_REQUIRED response', () => {
+test('classifyObservabilityPlusConfiguration: oplus_not_enabled on CLI OPLUS_REQUIRED response', () => {
   const r = classifyObservabilityPlusConfiguration({
     ok: false,
     code: 'OPLUS_REQUIRED',
@@ -56,7 +57,57 @@ test('classifyObservabilityPlusConfiguration: no_oplus_probe on CLI OPLUS_REQUIR
 
   assert.equal(r.ok, true);
   assert.equal(r.access, false);
-  assert.equal(r.blocker, 'no_oplus_probe');
+  assert.equal(r.blocker, 'oplus_not_enabled');
+});
+
+test('classifyObservabilityPlusConfiguration: project_disabled on project-level not-enabled response', () => {
+  const r = classifyObservabilityPlusConfiguration({
+    ok: false,
+    code: 'OPLUS_REQUIRED',
+    stderr: 'Observability Plus is not enabled for this project',
+  }, { projectId: 'prj_target' });
+
+  assert.equal(r.ok, true);
+  assert.equal(r.access, false);
+  assert.equal(r.blocker, 'project_disabled');
+  assert.match(r.detail, /not enabled for this project/);
+});
+
+test('classifyObservabilityPlusConfiguration: project_disabled on project disabled wording', () => {
+  const r = classifyObservabilityPlusConfiguration({
+    ok: false,
+    code: 'OPLUS_REQUIRED',
+    stderr: 'Observability Plus is disabled for this project',
+  }, { projectId: 'prj_target' });
+
+  assert.equal(r.ok, true);
+  assert.equal(r.access, false);
+  assert.equal(r.blocker, 'project_disabled');
+});
+
+test('classifyObservabilityPlusConfiguration: project_disabled on does-not-have-enabled wording', () => {
+  const r = classifyObservabilityPlusConfiguration({
+    ok: false,
+    code: 'OPLUS_REQUIRED',
+    stderr: 'This project does not have Observability Plus enabled',
+  }, { projectId: 'prj_target' });
+
+  assert.equal(r.ok, true);
+  assert.equal(r.access, false);
+  assert.equal(r.blocker, 'project_disabled');
+});
+
+test('classifyObservabilityPlusConfiguration: generic Observability Plus failure is inconclusive', () => {
+  const r = classifyObservabilityPlusConfiguration({
+    ok: false,
+    code: 'EXIT_1',
+    stderr: 'Failed to query Observability Plus configuration endpoint.',
+  }, { projectId: 'prj_target' });
+
+  assert.equal(r.ok, false);
+  assert.equal(r.access, null);
+  assert.equal(r.blocker, 'unknown');
+  assert.doesNotMatch(r.detail, /not enabled/i);
 });
 
 test('classifyObservabilityPlusConfiguration: generic 404 not-enabled text is inconclusive', () => {

@@ -7,7 +7,8 @@ import {
   checkCliVersion,
   checkAuth,
   resolveProjectId,
-  hasObservabilityPlus,
+  resolveTeamScope,
+  probeObservabilityPlusSchema,
   checkObservabilityPlusConfiguration,
   getMetricsSchema,
   getProjectConfig,
@@ -18,9 +19,11 @@ import {
   queryMetric,
   detectStack,
   redactSensitiveText,
+  classifyObservabilityPlusAccessText,
 } from '../lib/vercel.mjs';
 import { classifyFrameworkSupport } from '../lib/framework-support.mjs';
 import { QUERIES, TIME_WINDOW, normalizerFor } from '../lib/queries.mjs';
+import { join } from 'node:path';
 
 const SCHEMA_VERSION = '1.2';
 
@@ -66,17 +69,28 @@ async function main() {
 
   log('resolving project id…');
   const project = await resolveProjectId(explicitProjectId);
-  if (!project) {
-    throw new Error(
-      'NO_PROJECT_ID: pass one as argv, set VERCEL_PROJECT_ID, or run `vercel link` in this directory.'
-    );
+  if (!project?.ok) {
+    log(`scope resolution blocked: ${project?.blocker ?? 'unknown'} (${project?.detail ?? 'no detail'})`);
+    writeOutput(scopeBlockedOutput(project), { usable: true, blocker: null, detail: 'Scope was not resolved.' });
+    return;
   }
   log(`project link resolved (source=${project.source}; teamScope=${project.orgId ? 'yes' : 'no'})`);
 
-  const scope = project.orgId || undefined;
+  const teamScope = project.orgSlug
+    ? { ok: true, orgId: project.orgId, cliScope: project.orgSlug, source: 'link' }
+    : await resolveTeamScope(project.orgId);
+  if (!teamScope.ok) {
+    log(`team scope blocked: ${teamScope.blocker} (${teamScope.detail})`);
+    writeOutput(scopeBlockedOutput({ ...project, ...teamScope }), { usable: true, blocker: null, detail: 'Scope was not resolved.' });
+    return;
+  }
+  const scope = teamScope.cliScope || project.orgId || undefined;
+  log(`team scope resolved (source=${teamScope.source})`);
 
   log('checking framework support…');
-  const stack = await detectStack();
+  const stackRoot = projectRootCwd(project);
+  const stack = await detectStack(stackRoot);
+  stack.rootDirectory = project.rootDirectory ?? null;
   const frameworkSupport = classifyFrameworkSupport(stack);
   log(`framework=${stack.framework}@${stack.frameworkVersion ?? '?'} support=${frameworkSupport.status}`);
 
@@ -88,6 +102,7 @@ async function main() {
       projectId: project.projectId,
       orgId: project.orgId,
       projectIdSource: project.source,
+      ...scopeFields(project, teamScope),
       frameworkSupport,
       frameworkSupportBlocker: frameworkSupport.blocker,
       frameworkSupportDetail: frameworkSupport.detail,
@@ -124,14 +139,18 @@ async function main() {
   });
   log(`observabilityPlusPreflight=${observabilityPlusConfig.access === true ? 'enabled' : observabilityPlusConfig.blocker ?? 'unknown'} (${observabilityPlusConfig.source})`);
 
-  let oplus = observabilityPlusConfig.access === true;
+  let oplus = observabilityPlusConfig.access;
+  let schemaProbe = null;
   if (observabilityPlusConfig.access == null) {
     log('Observability Plus configuration preflight inconclusive; falling back to metrics schema probe…');
-    oplus = await hasObservabilityPlus(scope);
+    schemaProbe = await probeObservabilityPlusSchema(scope);
+    oplus = schemaProbe.access === true ? true : schemaProbe.access === false ? false : null;
   }
   log(`observabilityPlus=${oplus}`);
 
-  const schema = oplus ? await getMetricsSchema(scope) : null;
+  const schema = oplus === true
+    ? (schemaProbe?.ok ? schemaProbe.data : await getMetricsSchema(scope))
+    : null;
   if (oplus && schema) {
     const count = Array.isArray(schema) ? schema.length : (schema.metrics?.length ?? 0);
     log(`metric catalog: ${count} metrics available`);
@@ -141,7 +160,7 @@ async function main() {
   // the orchestrator can ask the user immediately instead of waiting on billing.
   let metrics = {};
   let metricsCanaryOk = false;
-  if (oplus) {
+  if (oplus === true) {
     log(`checking Observability Plus metrics access (window=${TIME_WINDOW})…`);
     const t0 = Date.now();
     const canary = await queryMetric('vercel.request.count', {
@@ -149,6 +168,7 @@ async function main() {
       since: TIME_WINDOW,
       limit: 1,
       scope,
+      projectId: project.projectId,
     });
     metricsCanaryOk = !!canary?.ok;
     if (!metricsCanaryOk) {
@@ -175,7 +195,7 @@ async function main() {
       }
     : (metricsCanaryOk
         ? { usable: true, blocker: null, detail: 'Observability Plus metrics access check passed.' }
-        : diagnoseObservabilityPlus(metrics, oplus));
+        : diagnoseObservabilityPlus(metrics, schemaProbe ?? oplus));
 
   if (!oplusDiag.usable && !continueWithoutObservability) {
     writeOutput({
@@ -185,6 +205,7 @@ async function main() {
       projectId: project.projectId,
       orgId: project.orgId,
       projectIdSource: project.source,
+      ...scopeFields(project, teamScope),
       observabilityPlus: oplus,
       observabilityPlusPreflight: observabilityPlusConfig,
       observabilityPlusUsable: oplusDiag.usable,
@@ -203,7 +224,7 @@ async function main() {
       usageScope: null,
       usageTeamTotal: null,
       usageError: 'NOT_COLLECTED_OBSERVABILITY_BLOCKED',
-      stack: null,
+      stack,
       metrics,
       metricsSchema: schema,
     }, oplusDiag);
@@ -229,7 +250,12 @@ async function main() {
   if (usageResult?.ok) {
     usage = usageResult.data;
     const contractContext = contract?.context;
-    if (usage?.context && contractContext && usage.context !== contractContext) {
+    const expectedContext = scope;
+    if (usage?.context && expectedContext && !sameContext(usage.context, expectedContext)) {
+      usageContextMismatch = true;
+      log(`usage: WARNING context mismatch — returned context=${usage.context} but resolved team scope=${expectedContext}; treating usage as unavailable for this project`);
+      usage = null;
+    } else if (usage?.context && contractContext && !sameContext(usage.context, contractContext)) {
       usageContextMismatch = true;
       log(`usage: WARNING context mismatch — returned context=${usage.context} but project team=${contractContext}; treating usage as unavailable for this project`);
       usage = null;
@@ -262,10 +288,10 @@ async function main() {
   log(`stack: ${stack.framework}@${stack.frameworkVersion ?? '?'} ${stack.hasAppRouter ? 'app-router' : ''}${stack.hasPagesRouter ? ' pages-router' : ''}${stack.orm !== 'none' ? ` orm=${stack.orm}` : ''}`);
 
   // Each query is wrapped; one failure degrades only that metric.
-  if (oplus && metricsCanaryOk) {
+  if (oplus === true && metricsCanaryOk) {
     log(`querying observability metrics (${QUERIES.length} metrics in parallel)…`);
     const t0 = Date.now();
-    metrics = await collectMetrics(scope);
+    metrics = await collectMetrics(scope, project.projectId);
     const wallMs = Date.now() - t0;
     const counts = Object.fromEntries(
       Object.entries(metrics).map(([k, v]) => {
@@ -289,7 +315,7 @@ async function main() {
         blocker: observabilityPlusConfig.blocker,
         detail: observabilityPlusConfig.detail,
       }
-    : diagnoseObservabilityPlus(metrics, oplus);
+    : diagnoseObservabilityPlus(metrics, schemaProbe ?? oplus);
 
 
   const output = {
@@ -299,6 +325,7 @@ async function main() {
     projectId: project.projectId,
     orgId: project.orgId,
     projectIdSource: project.source,
+    ...scopeFields(project, teamScope),
     observabilityPlus: oplus,
     observabilityPlusPreflight: observabilityPlusConfig,
     observabilityPlusUsable: oplusDiag.usable,
@@ -324,7 +351,21 @@ async function main() {
   writeOutput(output, oplusDiag);
 }
 
+function sameContext(a, b) {
+  return String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase();
+}
+
+function projectRootCwd(project) {
+  const root = String(project?.rootDirectory ?? '').trim();
+  if (!root || root === '.') return process.cwd();
+  return join(process.cwd(), root);
+}
+
 function writeOutput(output, oplusDiag, frameworkSupport = output.frameworkSupport) {
+  if (output.scopeBlocker) {
+    log(`⚠ Vercel project/team scope is not confirmed: blocker=${output.scopeBlocker} (${output.scopeBlockerDetail})`);
+    log('   The orchestrator should PAUSE and ask the user to confirm the exact team and project before proceeding.');
+  }
   if (frameworkSupport?.blocker) {
     log(`⚠ Framework is not supported for metric-backed route-to-file optimization: ${frameworkSupport.detail}`);
     log('   The orchestrator should PAUSE and ask whether to continue with a limited platform/scanner audit.');
@@ -338,7 +379,69 @@ function writeOutput(output, oplusDiag, frameworkSupport = output.frameworkSuppo
   log('done');
 }
 
-async function collectMetrics(scope) {
+function scopeFields(project, teamScope) {
+  return {
+    scopeResolution: {
+      ok: true,
+      projectId: project.projectId,
+      orgId: project.orgId,
+      orgSlug: project.orgSlug ?? null,
+      cliScope: teamScope.cliScope ?? null,
+      projectName: project.name ?? null,
+      projectIdSource: project.source,
+      inputProjectId: project.inputProjectId ?? null,
+      inputProjectIdSource: project.inputProjectIdSource ?? null,
+    },
+    scopeBlocker: null,
+    scopeBlockerDetail: null,
+    scopeChoices: project.choices ?? [],
+  };
+}
+
+function scopeBlockedOutput(resolution = {}) {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    collectedAt: new Date().toISOString(),
+    timeWindow: TIME_WINDOW,
+    projectId: resolution.projectId ?? null,
+    orgId: resolution.orgId ?? null,
+    projectIdSource: resolution.source ?? null,
+    scopeResolution: {
+      ok: false,
+      blocker: resolution.blocker ?? 'unknown',
+      detail: resolution.detail ?? 'Could not resolve Vercel project/team scope.',
+      inputProjectId: resolution.inputProjectId ?? resolution.projectId ?? null,
+      inputProjectIdSource: resolution.inputProjectIdSource ?? null,
+      linkedProjectCount: Array.isArray(resolution.choices) ? resolution.choices.length : 0,
+    },
+    scopeBlocker: resolution.blocker ?? 'unknown',
+    scopeBlockerDetail: resolution.detail ?? 'Could not resolve Vercel project/team scope.',
+    scopeChoices: resolution.choices ?? [],
+    frameworkSupport: null,
+    frameworkSupportBlocker: null,
+    frameworkSupportDetail: null,
+    observabilityPlus: null,
+    observabilityPlusPreflight: null,
+    observabilityPlusUsable: null,
+    observabilityPlusBlocker: null,
+    observabilityPlusBlockerDetail: null,
+    plan: {
+      plan: 'uncertain',
+      reason: 'not collected before project/team scope confirmation',
+    },
+    project: null,
+    contract: null,
+    usage: null,
+    usageScope: null,
+    usageTeamTotal: null,
+    usageError: 'NOT_COLLECTED_SCOPE_BLOCKED',
+    stack: null,
+    metrics: {},
+    metricsSchema: null,
+  };
+}
+
+async function collectMetrics(scope, projectId) {
   const results = await Promise.all(
     QUERIES.map(async (entry) => {
       const r = await queryMetric(entry.metricId, {
@@ -348,6 +451,7 @@ async function collectMetrics(scope) {
         since: TIME_WINDOW,
         limit: entry.limit,
         scope,
+        projectId,
       });
       return [entry, r];
     })
@@ -401,21 +505,38 @@ function sumUsageCosts(usage) {
 }
 
 // Returns { usable, blocker, detail }. `blocker` enum:
-//   null | 'no_oplus_probe' | 'project_disabled' | 'payment_required' |
-//   'forbidden' | 'daily_quota_exceeded' | 'project_not_found' |
-//   'not_linked' | 'all_failed_other' | 'no_traffic'
+//   null | 'oplus_not_enabled' | 'oplus_probe_failed' |
+//   'project_disabled' | 'payment_required' | 'forbidden' |
+//   'daily_quota_exceeded' | 'project_not_found' | 'not_linked' |
+//   'all_failed_other' | 'no_traffic'
 export function diagnoseObservabilityPlus(metrics, oplusProbe) {
-  if (!oplusProbe) {
+  const probe = normalizeObservabilityProbe(oplusProbe);
+  if (!probe.confirmed) {
+    const accessBlocker = explicitAccessBlocker(probe.result);
+    if (accessBlocker) {
+      return {
+        usable: false,
+        blocker: accessBlocker,
+        detail: accessBlocker === 'project_disabled'
+          ? 'The metrics probe reported that Observability Plus is not enabled for this project.'
+          : 'The metrics probe reported that Observability Plus is not enabled for the current Vercel scope.',
+      };
+    }
+    const code = probe.result?.code ? ` (code=${probe.result.code})` : '';
     return {
       usable: false,
-      blocker: 'no_oplus_probe',
-      detail: 'vercel metrics schema returned non-OK; the team does not have Observability Plus enabled.',
+      blocker: 'oplus_probe_failed',
+      detail: `\`vercel metrics schema\` returned non-OK${code}. This does not prove Observability Plus is disabled; verify the linked project/team context and inspect collect.stderr.`,
     };
   }
 
   const entries = Object.values(metrics);
   if (entries.length === 0) {
-    return { usable: false, blocker: 'no_oplus_probe', detail: 'No metrics were attempted.' };
+    return {
+      usable: false,
+      blocker: 'oplus_probe_failed',
+      detail: 'No per-route metric queries were attempted. This is an internal collection gap, not evidence that Observability Plus is disabled.',
+    };
   }
 
   const failures = entries.filter((m) => m && m.ok === false);
@@ -441,14 +562,14 @@ export function diagnoseObservabilityPlus(metrics, oplusProbe) {
         .map((f) => `${f.message ?? ''}\n${f.stderr ?? ''}`)
         .join('\n')
         .toLowerCase();
-      if (
-        /subscription to observability plus[\s\S]{0,160}required/.test(text) ||
-        /observability plus[\s\S]{0,160}not enabled/.test(text)
-      ) {
+      const accessBlocker = classifyObservabilityPlusAccessText(text);
+      if (accessBlocker) {
         return {
           usable: false,
-          blocker: 'no_oplus_probe',
-          detail: `${top[1]}/${entries.length} metric queries need route-level Observability Plus data. Enable Observability Plus, then re-run the metric-backed audit.`,
+          blocker: accessBlocker,
+          detail: accessBlocker === 'project_disabled'
+            ? `${top[1]}/${entries.length} metric queries reported that Observability Plus is not enabled for this project.`
+            : `${top[1]}/${entries.length} metric queries reported that Observability Plus is not enabled for the current Vercel scope.`,
         };
       }
       return {
@@ -497,6 +618,23 @@ export function diagnoseObservabilityPlus(metrics, oplusProbe) {
   }
 
   return { usable: true, blocker: null, detail: 'Observability Plus is usable; queries returned data.' };
+}
+
+function normalizeObservabilityProbe(probe) {
+  if (probe === true) return { confirmed: true, result: null };
+  if (probe && typeof probe === 'object') {
+    return {
+      confirmed: probe.access === true || probe.ok === true,
+      result: probe,
+    };
+  }
+  return { confirmed: false, result: null };
+}
+
+function explicitAccessBlocker(result) {
+  if (result?.blocker === 'oplus_not_enabled' || result?.blocker === 'project_disabled') return result.blocker;
+  const text = `${result?.message ?? ''}\n${result?.stderr ?? ''}`;
+  return classifyObservabilityPlusAccessText(text);
 }
 
 // Run main() only as a CLI; the test suite imports diagnoseObservabilityPlus directly.

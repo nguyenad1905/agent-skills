@@ -4,7 +4,7 @@
 // Byte-stable apart from totalWallMs; each CLI query is isolated.
 
 import { readFile } from 'node:fs/promises';
-import { queryMetric, readProjectJson } from '../lib/vercel.mjs';
+import { queryMetric, readLinkedProjects } from '../lib/vercel.mjs';
 import { specsForCandidate, mergeIntoEvidence, SCANNER_KINDS, TIME_WINDOW } from '../lib/deep-dive.mjs';
 
 const SCHEMA_VERSION = '1.0';
@@ -43,21 +43,24 @@ async function main() {
     log(`cwd: ${process.cwd()} (via --cwd)`);
   }
 
-  const link = await readProjectJson(process.cwd());
-  if (!link) {
+  const linked = await readLinkedProjects(process.cwd());
+  if (linked.projects.length === 0) {
     console.error(`[deep-dive] FATAL: cwd ${process.cwd()} has no .vercel/project.json or .vercel/repo.json.`);
     console.error('         Re-run with --cwd <project-dir> pointing at the linked project, or cd into it first.');
     console.error('         (The Vercel CLI resolves team/project from cwd; without a .vercel/ linkage every query returns empty rows for the wrong team.)');
     process.exit(2);
   }
-  if (merged.projectId && link.projectId !== merged.projectId) {
-    console.error('[deep-dive] FATAL: cwd .vercel/ links a different project than merged.json.');
+  const link = merged.projectId
+    ? linked.projects.find((p) => p.projectId === merged.projectId)
+    : (linked.projects.length === 1 ? linked.projects[0] : null);
+  if (!link) {
+    console.error('[deep-dive] FATAL: cwd .vercel/ does not unambiguously link to the collected project in merged.json.');
     console.error('         Re-run with --cwd <dir-linked-to-the-collected-project>.');
     process.exit(2);
   }
   log(`cwd link OK (source ${link.source})`);
 
-  const scope = merged.orgId || undefined;
+  const scope = merged.scopeResolution?.cliScope || merged.orgId || undefined;
   const toLaunch = Array.isArray(gate.toLaunch) ? gate.toLaunch : [];
   const platform = Array.isArray(gate.platform) ? gate.platform : [];
 
@@ -111,7 +114,7 @@ async function main() {
   // One CLI call per unique dedup key; jobs sharing a key share the result.
   const queryGroups = new Map();
   for (const job of remainingJobs) {
-    const key = queryKey(job.spec, scope);
+    const key = queryKey(job.spec, scope, merged.projectId);
     if (!queryGroups.has(key)) {
       queryGroups.set(key, { spec: job.spec, jobs: [] });
     }
@@ -130,6 +133,7 @@ async function main() {
       since: spec.since,
       limit: spec.limit,
       scope,
+      projectId: merged.projectId,
     });
     return { spec, jobs, response: r };
   }));
@@ -262,7 +266,7 @@ function tryExtractFromBroadPass(spec, merged) {
 
 // Two specs sharing this key answer the same question — one CLI call serves both.
 // Must include everything that affects the CLI's arg list.
-function queryKey(spec, scope) {
+function queryKey(spec, scope, projectId) {
   const groupBy = [...(spec.groupBy ?? [])].sort();
   return JSON.stringify({
     metricId: spec.metricId,
@@ -272,6 +276,7 @@ function queryKey(spec, scope) {
     since: spec.since ?? null,
     limit: spec.limit ?? null,
     scope: scope ?? null,
+    projectId: projectId ?? null,
   });
 }
 

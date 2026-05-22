@@ -21,7 +21,7 @@ Manual install: copy `skills/vercel-optimize` into `.agents/skills/vercel-optimi
 - Node.js 20+
 - Vercel CLI with `vercel metrics`, `vercel usage`, `vercel contract`, and `vercel api` support (`npm i -g vercel@latest`). The skill enforces v53+ as its compatibility floor.
 - Authenticated Vercel CLI session (`vercel login`)
-- Linked Vercel project directory (`vercel link`) for route metrics. `VERCEL_PROJECT_ID` can resolve project config, but it does not replace directory linkage for `vercel metrics`.
+- Linked Vercel directory (`vercel link` for one project, or the repo root from `vercel link --repo` for multi-project repos) for route metrics. `VERCEL_PROJECT_ID` can select a project only when it matches the linked cwd; it does not replace directory linkage for `vercel metrics`. Multi-project links require an explicit matching project ID.
 - Observability Plus for metric-backed route ranking
 - Code-backed recommendation coverage is strongest for Next.js and SvelteKit, supported for Nuxt route mapping with generic checks, and limited for Astro. Hono, Remix, and unknown frameworks pause up front.
 
